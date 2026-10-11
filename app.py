@@ -25,15 +25,18 @@ if uploaded_file is not None:
         df = pd.read_excel(uploaded_file)
 
         required = [
-            "Supplier", "Invoice_Number",
-            "Invoice_Date", "Amount"
+            "Supplier",
+            "Invoice_Number",
+            "Invoice_Date",
+            "Amount"
         ]
 
         if not all(col in df.columns for col in required):
             st.error(
-                "Excel must contain: Supplier, Invoice_Number, "
-                "Invoice_Date and Amount."
+                "Excel must contain these columns: "
+                "Supplier, Invoice_Number, Invoice_Date, Amount"
             )
+
         else:
             df["Potential_Duplicate"] = df.duplicated(
                 subset=["Supplier", "Invoice_Number"],
@@ -51,10 +54,13 @@ if uploaded_file is not None:
             )
 
             if exceptions.empty:
-                st.success("No potential duplicates detected.")
+                st.success(
+                    "No potential duplicate invoices detected."
+                )
             else:
                 st.warning(
-                    "Potential duplicates require verification."
+                    "Potential duplicates found. "
+                    "Verify supporting documents before concluding."
                 )
                 st.dataframe(
                     exceptions,
@@ -62,9 +68,16 @@ if uploaded_file is not None:
                 )
 
             output = BytesIO()
+
             with pd.ExcelWriter(
-                output, engine="openpyxl"
+                output,
+                engine="openpyxl"
             ) as writer:
+                df.to_excel(
+                    writer,
+                    sheet_name="All Invoices",
+                    index=False
+                )
                 exceptions.to_excel(
                     writer,
                     sheet_name="Exceptions",
@@ -72,7 +85,7 @@ if uploaded_file is not None:
                 )
 
             st.download_button(
-                "Download Audit Report",
+                label="Download Audit Report",
                 data=output.getvalue(),
                 file_name="Duplicate_Invoice_Report.xlsx",
                 mime=(
@@ -87,22 +100,23 @@ if uploaded_file is not None:
             question = st.text_area(
                 "Ask a question about the audit findings",
                 placeholder=(
-                    "Example: Explain the risks and suggest "
-                    "audit procedures for these invoices."
+                    "Explain the risks and suggest audit procedures "
+                    "for these duplicate invoices."
                 )
             )
 
             if st.button("Ask AI"):
                 if not question.strip():
                     st.warning("Please enter a question.")
+
                 else:
                     try:
+                        api_key = st.secrets["GEMINI_API_KEY"]
+
                         client = genai.Client(
-                            api_key=st.secrets["GEMINI_API_KEY"]
+                            api_key=api_key
                         )
 
-                        # Send only the flagged rows and
-                        # the user's question to the model.
                         findings = exceptions[
                             required
                         ].to_dict(orient="records")
@@ -117,31 +131,45 @@ User question:
 {question}
 
 Provide:
-1. What the findings indicate.
+1. Explanation of the findings.
 2. Potential audit risks.
 3. Relevant audit assertions.
 4. Practical follow-up audit procedures.
 
 Do not assume fraud or conclude an error without evidence.
-Explain that supporting documents and payment records
-must be checked. Do not invent facts or legal references.
+Recommend checking original invoices, purchase orders,
+goods receipt notes, ledger postings and payment records
+where relevant.
+
+Do not invent facts or legal references.
+Clearly distinguish potential exceptions from confirmed errors.
 """
 
-                        with st.spinner("AI is analysing..."):
+                        with st.spinner(
+                            "AI is analysing the findings..."
+                        ):
                             response = client.models.generate_content(
                                 model="gemini-2.5-flash",
                                 contents=prompt
                             )
 
-                        st.subheader("AI Analysis")
-                        st.write(response.text)
+                        if response.text:
+                            st.subheader("AI Analysis")
+                            st.markdown(response.text)
+                        else:
+                            st.warning(
+                                "The AI returned an empty response."
+                            )
 
                     except Exception as e:
-    st.error("AI request failed")
-    st.code(f"{type(e).__name__}: {e}")
+                        st.error("AI request failed.")
+                        st.code(
+                            f"{type(e).__name__}: {e}"
+                        )
 
-    except Exception:
+    except Exception as e:
         st.error(
-            "Could not read the Excel file. Please check "
-            "that it is a valid .xlsx purchase register."
+            "Could not read the Excel file. "
+            "Please check that it is a valid .xlsx purchase register."
         )
+        st.code(f"{type(e).__name__}: {e}")
