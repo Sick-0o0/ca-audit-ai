@@ -136,12 +136,9 @@ must be checked. Do not invent facts or legal references.
                         st.subheader("AI Analysis")
                         st.write(response.text)
 
-                    except Exception:
-                        st.error(
-                            "AI request failed. Check your API "
-                            "key, model availability, API quota "
-                            "and Streamlit app logs."
-                        )
+                    except Exception as e:
+    st.error("AI request failed")
+    st.code(f"{type(e).__name__}: {e}")
 
     except Exception:
         st.error(
