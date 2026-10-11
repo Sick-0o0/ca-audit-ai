@@ -1,8 +1,15 @@
 
-import streamlit as st
-import pandas as pd
+import time
 from io import BytesIO
+
+import pandas as pd
+import streamlit as st
 from google import genai
+
+
+# --------------------------------------------------
+# PAGE CONFIGURATION
+# --------------------------------------------------
 
 st.set_page_config(
     page_title="CA Audit AI",
@@ -11,325 +18,648 @@ st.set_page_config(
 )
 
 st.title("CA Audit AI")
-st.caption("Accounting & Audit Analytics")
+st.caption("Excel-based audit checks and AI-assisted analysis")
 
-# ---------- COMMON AI FUNCTION ----------
+
+# --------------------------------------------------
+# GEMINI AI WITH AUTOMATIC RETRIES
+# --------------------------------------------------
+
+MODEL_NAME = "gemini-3.8-flash"
+
+
+def generate_ai_response(client, prompt):
+    """
+    Retry temporary Gemini errors up to 4 times.
+    Waits 2, 4 and 8 seconds between attempts.
+    """
+
+    last_error = None
+
+    for attempt in range(4):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt
+            )
+            return response
+
+        except Exception as error:
+            last_error = error
+            error_text = str(error).upper()
+
+            temporary_error = any(
+                code in error_text
+                for code in [
+                    "503",
+                    "UNAVAILABLE",
+                    "429",
+                    "RESOURCE_EXHAUSTED",
+                    "500",
+                    "INTERNAL",
+                    "502",
+                    "504",
+                    "TIMEOUT"
+                ]
+            )
+
+            if not temporary_error:
+                raise
+
+            if attempt < 3:
+                wait_seconds = 2 ** (attempt + 1)
+
+                st.warning(
+                    f"AI server is busy. "
+                    f"Retrying in {wait_seconds} seconds "
+                    f"(attempt {attempt + 2} of 4)..."
+                )
+
+                time.sleep(wait_seconds)
+
+    raise RuntimeError(
+        "Gemini remained unavailable after 4 attempts. "
+        "Please try again later. Details: "
+        + str(last_error)
+    )
+
 
 def ask_ai(question, findings, module_name):
+    """Send audit findings to Gemini and display its response."""
+
     try:
-        client = genai.Client(
-            api_key=st.secrets["GEMINI_API_KEY"]
-        )
+        api_key = st.secrets["GEMINI_API_KEY"]
+        client = genai.Client(api_key=api_key)
+
+        findings_text = findings.to_string(index=False)
 
         prompt = f"""
 You are an audit assistant supporting a Chartered Accountant.
 
-Audit module: {module_name}
-Potential exceptions:
-{findings}
+Module: {module_name}
 
-User question:
+User's question:
 {question}
 
-Provide:
-1. Explanation of findings.
-2. Potential audit risks.
-3. Relevant audit assertions.
-4. Practical further audit procedures.
+Audit findings:
+{findings_text}
 
-Do not assume fraud or conclude an error without evidence.
-Distinguish potential exceptions from confirmed errors.
-Do not invent facts or legal references.
+Provide a concise, structured response with:
+1. Explanation of the findings.
+2. Potential audit risks.
+3. Relevant financial statement assertions, where applicable.
+4. Suggested audit procedures and supporting documents to verify.
+5. Practical next steps.
+
+Important:
+- A flagged transaction is not automatically fraud.
+- Do not claim that fraud has occurred without evidence.
+- Do not invent accounting standards, legal provisions or facts.
+- Clearly distinguish observations from conclusions.
+- Treat these findings as preliminary and requiring verification.
 """
 
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt
-        )
+        with st.spinner("Generating AI analysis..."):
+            response = generate_ai_response(client, prompt)
 
         if response.text:
             st.subheader("AI Analysis")
             st.markdown(response.text)
         else:
-            st.warning("AI returned an empty response.")
+            st.warning(
+                "The AI returned an empty response. "
+                "Please try again."
+            )
 
-    except Exception as e:
-        st.error("AI request failed.")
-        st.code(f"{type(e).__name__}: {e}")
+    except Exception as error:
+        st.error(
+            "AI analysis could not be completed. "
+            "Your Excel-based checks can still be reviewed."
+        )
+        st.code(f"{type(error).__name__}: {error}")
 
 
-# ---------- MODULE 1: DUPLICATE INVOICES ----------
+# --------------------------------------------------
+# EXCEL DOWNLOAD HELPER
+# --------------------------------------------------
 
-st.header("1. Duplicate Invoice Detection")
+def convert_df_to_excel(dataframe, sheet_name):
+    output = BytesIO()
 
-purchase_file = st.file_uploader(
-    "Upload Purchase Register",
-    type=["xlsx"],
-    key="purchase_file"
+    with pd.ExcelWriter(
+        output,
+        engine="openpyxl"
+    ) as writer:
+        dataframe.to_excel(
+            writer,
+            index=False,
+            sheet_name=sheet_name
+        )
+
+    return output.getvalue()
+
+
+# --------------------------------------------------
+# SIDEBAR MODULE SELECTION
+# --------------------------------------------------
+
+module = st.sidebar.selectbox(
+    "Select Audit Module",
+    [
+        "Duplicate Invoice Detection",
+        "Journal Entry Testing"
+    ]
 )
 
-if purchase_file is not None:
-    try:
-        purchase = pd.read_excel(purchase_file)
 
-        purchase_columns = [
-            "Supplier",
-            "Invoice_Number",
-            "Invoice_Date",
-            "Amount"
-        ]
+# ==================================================
+# MODULE 1: DUPLICATE INVOICE DETECTION
+# ==================================================
 
-        if not all(c in purchase.columns for c in purchase_columns):
-            st.error(
-                "Required columns: Supplier, Invoice_Number, "
-                "Invoice_Date, Amount"
-            )
-        else:
-            purchase["Potential_Duplicate"] = purchase.duplicated(
-                subset=["Supplier", "Invoice_Number"],
-                keep=False
-            )
+if module == "Duplicate Invoice Detection":
 
-            duplicates = purchase[
-                purchase["Potential_Duplicate"]
-            ].copy()
+    st.header("Duplicate Invoice Detection")
 
-            st.metric("Total Invoices", len(purchase))
-            st.metric(
-                "Potential Duplicate Entries",
-                len(duplicates)
-            )
+    st.write(
+        "Upload a purchase register to identify repeated "
+        "supplier and invoice number combinations."
+    )
 
-            if duplicates.empty:
-                st.success("No potential duplicates detected.")
+    uploaded_file = st.file_uploader(
+        "Upload Purchase Register Excel",
+        type=["xlsx", "xls"],
+        key="purchase_register"
+    )
+
+    if uploaded_file is not None:
+
+        try:
+            df = pd.read_excel(uploaded_file)
+
+            st.subheader("Uploaded Data")
+            st.dataframe(df, use_container_width=True)
+
+            required_columns = [
+                "Supplier",
+                "Invoice_Number",
+                "Invoice_Date",
+                "Amount"
+            ]
+
+            missing_columns = [
+                column
+                for column in required_columns
+                if column not in df.columns
+            ]
+
+            if missing_columns:
+                st.error(
+                    "Missing required columns: "
+                    + ", ".join(missing_columns)
+                )
+
+                st.info(
+                    "Required columns: Supplier, Invoice_Number, "
+                    "Invoice_Date, Amount. Rename your Excel "
+                    "headers to match these names."
+                )
+
             else:
-                st.warning(
-                    "Potential duplicates require verification."
-                )
-                st.dataframe(
-                    duplicates,
-                    use_container_width=True
-                )
-
-            report = BytesIO()
-
-            with pd.ExcelWriter(report, engine="openpyxl") as writer:
-                purchase.to_excel(
-                    writer, sheet_name="All Invoices", index=False
-                )
-                duplicates.to_excel(
-                    writer, sheet_name="Exceptions", index=False
+                df["Supplier"] = (
+                    df["Supplier"]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .str.upper()
                 )
 
-            st.download_button(
-                "Download Invoice Audit Report",
-                data=report.getvalue(),
-                file_name="Invoice_Audit_Report.xlsx",
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                ),
-                key="download_invoice_report"
-            )
+                df["Invoice_Number"] = (
+                    df["Invoice_Number"]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .str.upper()
+                )
 
-            st.subheader("Ask AI about Invoice Findings")
+                df["Amount"] = pd.to_numeric(
+                    df["Amount"],
+                    errors="coerce"
+                )
 
-            invoice_question = st.text_area(
-                "Your question",
-                key="invoice_question",
-                placeholder="Explain the risks and audit procedures."
-            )
+                valid_invoice = (
+                    df["Supplier"].ne("")
+                    & df["Invoice_Number"].ne("")
+                )
 
-            if st.button("Analyse Invoice Findings with AI"):
-                if not invoice_question.strip():
-                    st.warning("Enter a question first.")
-                elif duplicates.empty:
-                    st.info("There are no flagged invoice entries to analyse.")
-                else:
-                    ask_ai(
-                        invoice_question,
-                        duplicates[purchase_columns].to_dict(
-                            orient="records"
-                        ),
-                        "Duplicate Invoice Testing"
+                duplicate_mask = (
+                    valid_invoice
+                    & df.duplicated(
+                        subset=[
+                            "Supplier",
+                            "Invoice_Number"
+                        ],
+                        keep=False
+                    )
+                )
+
+                duplicates = df.loc[
+                    duplicate_mask
+                ].copy()
+
+                total_records = len(df)
+                duplicate_rows = len(duplicates)
+                duplicate_groups = (
+                    duplicates.groupby(
+                        ["Supplier", "Invoice_Number"],
+                        dropna=False
+                    ).ngroups
+                    if not duplicates.empty
+                    else 0
+                )
+
+                col1, col2, col3 = st.columns(3)
+
+                col1.metric(
+                    "Total Records",
+                    total_records
+                )
+
+                col2.metric(
+                    "Flagged Rows",
+                    duplicate_rows
+                )
+
+                col3.metric(
+                    "Duplicate Groups",
+                    duplicate_groups
+                )
+
+                st.subheader("Duplicate Invoice Results")
+
+                if duplicates.empty:
+                    st.success(
+                        "No duplicate supplier and invoice "
+                        "number combinations were detected."
                     )
 
-    except Exception as e:
-        st.error("Could not process the purchase register.")
-        st.code(f"{type(e).__name__}: {e}")
+                else:
+                    st.warning(
+                        "Potential duplicate invoices detected. "
+                        "Verify the supporting documents before "
+                        "drawing any conclusion."
+                    )
 
+                    st.dataframe(
+                        duplicates,
+                        use_container_width=True
+                    )
+
+                report = df.copy()
+                report["Duplicate_Flag"] = duplicate_mask
+
+                st.download_button(
+                    label="Download Duplicate Invoice Report",
+                    data=convert_df_to_excel(
+                        report,
+                        "Duplicate_Report"
+                    ),
+                    file_name="Duplicate_Invoice_Report.xlsx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    )
+                )
+
+                st.divider()
+                st.subheader("Ask AI About These Findings")
+
+                question = st.text_area(
+                    "Enter your audit question",
+                    value=(
+                        "Explain the potential risks in these "
+                        "duplicate invoice findings and suggest "
+                        "audit procedures."
+                    ),
+                    key="duplicate_question"
+                )
+
+                if st.button(
+                    "Analyse Duplicate Invoices with AI",
+                    key="duplicate_ai"
+                ):
+
+                    if duplicates.empty:
+                        st.info(
+                            "No duplicate rows were detected. "
+                            "You can still review the data manually."
+                        )
+
+                    elif not question.strip():
+                        st.warning(
+                            "Please enter a question first."
+                        )
+
+                    else:
+                        ask_ai(
+                            question,
+                            duplicates,
+                            "Duplicate Invoice Detection"
+                        )
+
+        except Exception as error:
+            st.error("Unable to read or process the Excel file.")
+            st.code(f"{type(error).__name__}: {error}")
+
+
+# ==================================================
+# MODULE 2: JOURNAL ENTRY TESTING
+# ==================================================
+
+elif module == "Journal Entry Testing":
+
+    st.header("Journal Entry Testing")
+
+    st.write(
+        "Upload a journal entry listing to identify entries "
+        "that may require further audit investigation."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Upload Journal Entries Excel",
+        type=["xlsx", "xls"],
+        key="journal_entries"
+    )
+
+    if uploaded_file is not None:
+
+        try:
+            df = pd.read_excel(uploaded_file)
+
+            st.subheader("Uploaded Data")
+            st.dataframe(df, use_container_width=True)
+
+            required_columns = [
+                "Entry_ID",
+                "Posting_Date",
+                "Debit_Account",
+                "Credit_Account",
+                "Amount",
+                "Description",
+                "Prepared_By",
+                "Approved_By"
+            ]
+
+            missing_columns = [
+                column
+                for column in required_columns
+                if column not in df.columns
+            ]
+
+            if missing_columns:
+                st.error(
+                    "Missing required columns: "
+                    + ", ".join(missing_columns)
+                )
+
+                st.info(
+                    "Rename your Excel headers to match the "
+                    "required column names shown above."
+                )
+
+            else:
+                data = df.copy()
+
+                data["Posting_Date"] = pd.to_datetime(
+                    data["Posting_Date"],
+                    errors="coerce"
+                )
+
+                data["Amount"] = pd.to_numeric(
+                    data["Amount"],
+                    errors="coerce"
+                )
+
+                prepared = (
+                    data["Prepared_By"]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .str.casefold()
+                )
+
+                approved = (
+                    data["Approved_By"]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .str.casefold()
+                )
+
+                debit_account = (
+                    data["Debit_Account"]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .str.casefold()
+                )
+
+                credit_account = (
+                    data["Credit_Account"]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .str.casefold()
+                )
+
+                # Rule 1: Round figure amounts
+                data["Round_Figure"] = (
+                    data["Amount"].notna()
+                    & data["Amount"].gt(0)
+                    & data["Amount"].mod(10000).eq(0)
+                )
+
+                # Rule 2: Posting date falls on day 28, 29, 30 or 31
+                data["Period_End"] = (
+                    data["Posting_Date"].notna()
+                    & data["Posting_Date"].dt.day.ge(28)
+                )
+
+                # Rule 3: Weekend postings
+                data["Weekend_Posting"] = (
+                    data["Posting_Date"].notna()
+                    & data["Posting_Date"].dt.dayofweek.ge(5)
+                )
+
+                # Rule 4: Missing approval
+                data["Missing_Approval"] = approved.eq("")
+
+                # Rule 5: Same person prepared and approved
+                data["Self_Approval"] = (
+                    prepared.ne("")
+                    & approved.ne("")
+                    & prepared.eq(approved)
+                )
+
+                # Rule 6: Suspense account used
+                data["Suspense_Account"] = (
+                    debit_account.str.contains(
+                        "suspense",
+                        regex=False
+                    )
+                    | credit_account.str.contains(
+                        "suspense",
+                        regex=False
+                    )
+                )
+
+                flag_columns = [
+                    "Round_Figure",
+                    "Period_End",
+                    "Weekend_Posting",
+                    "Missing_Approval",
+                    "Self_Approval",
+                    "Suspense_Account"
+                ]
+
+                data["Flag_Count"] = (
+                    data[flag_columns]
+                    .astype(int)
+                    .sum(axis=1)
+                )
+
+                flagged = data.loc[
+                    data["Flag_Count"] > 0
+                ].copy()
+
+                col1, col2, col3 = st.columns(3)
+
+                col1.metric(
+                    "Total Journal Entries",
+                    len(data)
+                )
+
+                col2.metric(
+                    "Flagged Entries",
+                    len(flagged)
+                )
+
+                col3.metric(
+                    "Flagged Rule Occurrences",
+                    int(data[flag_columns].astype(int).sum().sum())
+                )
+
+                st.subheader("Rule-wise Results")
+
+                rule_counts = pd.DataFrame({
+                    "Audit Rule": flag_columns,
+                    "Flagged Entries": [
+                        int(data[column].sum())
+                        for column in flag_columns
+                    ]
+                })
+
+                st.dataframe(
+                    rule_counts,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                st.subheader("Flagged Journal Entries")
+
+                if flagged.empty:
+                    st.success(
+                        "No entries were flagged by the selected "
+                        "rules. This does not guarantee that all "
+                        "journal entries are free from error."
+                    )
+
+                else:
+                    st.warning(
+                        "Review the flagged entries and verify "
+                        "supporting documents, business purpose "
+                        "and approval requirements."
+                    )
+
+                    st.dataframe(
+                        flagged,
+                        use_container_width=True
+                    )
+
+                st.download_button(
+                    label="Download Journal Entry Audit Report",
+                    data=convert_df_to_excel(
+                        data,
+                        "Journal_Audit_Report"
+                    ),
+                    file_name="Journal_Entry_Audit_Report.xlsx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    )
+                )
+
+                st.divider()
+                st.subheader("Ask AI About Journal Entry Findings")
+
+                question = st.text_area(
+                    "Enter your audit question",
+                    value=(
+                        "Explain the flagged journal entries, "
+                        "their potential audit risks and the "
+                        "procedures I should perform."
+                    ),
+                    key="journal_question"
+                )
+
+                if st.button(
+                    "Analyse Journal Entries with AI",
+                    key="journal_ai"
+                ):
+
+                    if flagged.empty:
+                        st.info(
+                            "No entries were flagged. You can "
+                            "still ask a general audit question "
+                            "about the uploaded journal listing."
+                        )
+
+                        findings_for_ai = data.head(100)
+
+                    else:
+                        findings_for_ai = flagged.head(100)
+
+                    if not question.strip():
+                        st.warning(
+                            "Please enter a question first."
+                        )
+
+                    else:
+                        ask_ai(
+                            question,
+                            findings_for_ai,
+                            "Journal Entry Testing"
+                        )
+
+                st.caption(
+                    "Rule limitation: Posting dates on day 28 or "
+                    "later are only preliminary indicators, not "
+                    "confirmed month-end entries. The round-figure "
+                    "threshold is ₹10,000. Adjust these rules to "
+                    "your audit methodology and client data."
+                )
+
+        except Exception as error:
+            st.error("Unable to read or process the Excel file.")
+            st.code(f"{type(error).__name__}: {error}")
+
+
+# --------------------------------------------------
+# FOOTER
+# --------------------------------------------------
 
 st.divider()
 
-# ---------- MODULE 2: JOURNAL ENTRY TESTING ----------
-
-st.header("2. Journal Entry Testing")
-
-journal_file = st.file_uploader(
-    "Upload Journal Entries Excel File",
-    type=["xlsx"],
-    key="journal_file"
+st.caption(
+    "CA Audit AI | Automated flags are preliminary indicators "
+    "and must be validated using appropriate audit evidence."
 )
-
-if journal_file is not None:
-    try:
-        journals = pd.read_excel(journal_file)
-
-        journal_columns = [
-            "Entry_ID",
-            "Posting_Date",
-            "Debit_Account",
-            "Credit_Account",
-            "Amount",
-            "Description",
-            "Prepared_By",
-            "Approved_By"
-        ]
-
-        if not all(c in journals.columns for c in journal_columns):
-            st.error(
-                "Required columns: Entry_ID, Posting_Date, "
-                "Debit_Account, Credit_Account, Amount, "
-                "Description, Prepared_By, Approved_By"
-            )
-        else:
-            journals["Posting_Date"] = pd.to_datetime(
-                journals["Posting_Date"], errors="coerce"
-            )
-
-            journals["Amount"] = pd.to_numeric(
-                journals["Amount"], errors="coerce"
-            )
-
-            debit_account = (
-                journals["Debit_Account"].fillna("").astype(str).str.lower()
-            )
-            credit_account = (
-                journals["Credit_Account"].fillna("").astype(str).str.lower()
-            )
-
-            prepared = (
-                journals["Prepared_By"].fillna("").astype(str).str.strip()
-            )
-            approved = (
-                journals["Approved_By"].fillna("").astype(str).str.strip()
-            )
-
-            journals["Round_Figure"] = (
-                journals["Amount"].gt(0)
-                & journals["Amount"].mod(10000).eq(0)
-            )
-
-            journals["Period_End"] = (
-                journals["Posting_Date"].dt.day.ge(28)
-            )
-
-            journals["Weekend_Posting"] = (
-                journals["Posting_Date"].dt.dayofweek.ge(5)
-            )
-
-            journals["Missing_Approval"] = approved.eq("")
-
-            journals["Self_Approval"] = (
-                prepared.ne("")
-                & approved.ne("")
-                & prepared.str.casefold().eq(approved.str.casefold())
-            )
-
-            journals["Suspense_Account"] = (
-                debit_account.str.contains("suspense", na=False)
-                | credit_account.str.contains("suspense", na=False)
-            )
-
-            rule_columns = [
-                "Round_Figure",
-                "Period_End",
-                "Weekend_Posting",
-                "Missing_Approval",
-                "Self_Approval",
-                "Suspense_Account"
-            ]
-
-            journals["Flag_Count"] = journals[rule_columns].sum(axis=1)
-
-            flagged = journals[
-                journals["Flag_Count"] > 0
-            ].copy()
-
-            st.metric("Total Journal Entries", len(journals))
-            st.metric("Potential Exceptions", len(flagged))
-
-            st.caption(
-                "Flags are screening indicators, not proof of "
-                "misstatement or fraud."
-            )
-
-            if flagged.empty:
-                st.success("No entries were flagged by these rules.")
-            else:
-                st.dataframe(
-                    flagged,
-                    use_container_width=True
-                )
-
-            st.subheader("Exception Summary")
-
-            for rule in rule_columns:
-                st.write(
-                    f"{rule.replace('_', ' ')}: "
-                    f"{int(journals[rule].sum())} entries"
-                )
-
-            journal_report = BytesIO()
-
-            with pd.ExcelWriter(
-                journal_report, engine="openpyxl"
-            ) as writer:
-                journals.to_excel(
-                    writer, sheet_name="All Entries", index=False
-                )
-                flagged.to_excel(
-                    writer, sheet_name="Exceptions", index=False
-                )
-
-            st.download_button(
-                "Download Journal Audit Report",
-                data=journal_report.getvalue(),
-                file_name="Journal_Entry_Audit_Report.xlsx",
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                ),
-                key="download_journal_report"
-            )
-
-            st.subheader("Ask AI about Journal Findings")
-
-            journal_question = st.text_area(
-                "Your question",
-                key="journal_question",
-                placeholder=(
-                    "Explain the flagged entries and suggest "
-                    "further audit procedures."
-                )
-            )
-
-            if st.button("Analyse Journal Findings with AI"):
-                if not journal_question.strip():
-                    st.warning("Enter a question first.")
-                elif flagged.empty:
-                    st.info("No flagged entries to analyse.")
-                else:
-                    safe_findings = flagged[
-                        journal_columns + rule_columns + ["Flag_Count"]
-                    ].to_dict(orient="records")
-
-                    ask_ai(
-                        journal_question,
-                        safe_findings,
-                        "Journal Entry Testing"
-                    )
-
-    except Exception as e:
-        st.error("Could not process the journal entries file.")
-        st.code(f"{type(e).__name__}: {e}")
