@@ -91,6 +91,18 @@ Explain:
 4. Further audit procedures and supporting documents.
 5. Practical next steps.
 
+At the VERY END, add a separate section titled exactly:
+## Humanised Summary (In Simple English)
+
+In this final section:
+- Explain the main result in 2-4 short sentences using everyday English.
+- Assume the reader has no accounting or audit background.
+- Briefly state what was noticed, why it may matter, and what should happen next.
+- Explain technical terms in plain words or avoid them.
+- Keep it concise and easy to understand without requiring the reader to read the full analysis.
+- Do not add new facts that are not supported by the data or analysis.
+- If the flags only indicate possible risks, clearly say they are not proof of an error or fraud.
+
 A flagged item is not automatically an error or fraud.
 Do not invent facts, laws, standards or accounting references.
 Clearly distinguish observations from conclusions.
